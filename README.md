@@ -31,7 +31,7 @@
 
 ```bash
 # 环境
-uv venv --python=3.10 && source .venv/bin/activate
+pip install uv
 uv pip install stable-worldmodel[train,env]
 
 # 数据（PushT 为例）
