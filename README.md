@@ -1,22 +1,9 @@
+# LeWM — 从像素端到端训练的世界模型
 
-# LeWorldModel
-### Stable End-to-End Joint-Embedding Predictive Architecture from Pixels
+基于 JEPA（联合嵌入预测架构）的极简世界模型。只用两项 loss（预测误差 + 高斯正则），无 EMA、无 stop-gradient、无辅助监督。15M 参数，单 GPU 数小时可训完，规划速度比基于 foundation model 的世界模型快 48 倍。
 
-[Lucas Maes*](https://x.com/lucasmaes_), [Quentin Le Lidec*](https://quentinll.github.io/), [Damien Scieur](https://scholar.google.com/citations?user=hNscQzgAAAAJ&hl=fr), [Yann LeCun](https://yann.lecun.com/) and [Randall Balestriero](https://randallbalestriero.github.io/)
+论文: [arxiv.org/pdf/2603.19312v1](https://arxiv.org/pdf/2603.19312v1) | 数据: [HuggingFace](https://huggingface.co/collections/quentinll/lewm) | [项目主页](https://le-wm.github.io/)
 
-**Abstract:** Joint Embedding Predictive Architectures (JEPAs) offer a compelling framework for learning world models in compact latent spaces, yet existing methods remain fragile, relying on complex multi-term losses, exponential moving averages, pretrained encoders, or auxiliary supervision to avoid representation collapse. In this work, we introduce LeWorldModel (LeWM), the first JEPA that trains stably end-to-end from raw pixels using only two loss terms: a next-embedding prediction loss and a regularizer enforcing Gaussian-distributed latent embeddings. This reduces tunable loss hyperparameters from six to one compared to the only existing end-to-end alternative. With ~15M parameters trainable on a single GPU in a few hours, LeWM plans up to 48× faster than foundation-model-based world models while remaining competitive across diverse 2D and 3D control tasks. Beyond control, we show that LeWM's latent space encodes meaningful physical structure through probing of physical quantities. Surprise evaluation confirms that the model reliably detects physically implausible events.
-
-<p align="center">
-   <b>[ <a href="https://arxiv.org/pdf/2603.19312v1">Paper</a> | <a href="https://huggingface.co/collections/quentinll/lewm">Checkpoints &amp; Data</a> | <a href="https://le-wm.github.io/">Website</a> ]</b>
-</p>
-
-<br>
-
-<p align="center">
-  <img src="assets/lewm.gif" width="80%">
-</p>
-
-If you find this code useful, please reference it in your paper:
 ```
 @article{maes_lelidec2026lewm,
   title={LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels},
@@ -28,462 +15,414 @@ If you find this code useful, please reference it in your paper:
 
 ---
 
-## How LeWM Works
+## 目录
 
-### Core Principle: Predict Embeddings, Not Pixels
-
-Traditional world models (e.g., Dreamer) reconstruct raw pixels frame-by-frame. This forces the model to waste capacity on irrelevant details — wall textures, lighting noise, static backgrounds. JEPA flips this: the **encoder** compresses each image into a compact embedding vector (192-dim) that only retains what matters for the future, and the **predictor** forecasts the next embedding directly. At no point does the model generate pixels.
-
-
-
-### Architecture
-
-```
-                    Training                           │              Inference (MPC)
-                                                       │
-  pixels (B,T,C,H,W)                                   │   current obs + goal image
-       │                                               │         │
-       ▼                                               │         ▼
-  ┌──────────┐    ┌──────────┐                         │   encode(obs)  encode(goal)
-  │  ViT     │    │  ViT     │  ← same encoder          │     │              │
-  │ (shared) │    │ (shared) │    no EMA, no stop-grad  │     ▼              ▼
-  └────┬─────┘    └────┬─────┘                         │   emb_0         goal_emb
-       │               │                               │     │
-       ▼               ▼                               │     ▼
-  ┌──────────┐    ┌──────────┐                         │   ┌──────────────────────┐
-  │projector │    │projector │  ← MLP(192→2048→192)    │   │ Sample 64 action     │
-  └────┬─────┘    └────┬─────┘                         │   │ sequences (T steps)  │
-       │               │                               │   └─────────┬────────────┘
-       ▼               ▼                               │             │
-  emb (B,T,192)   tgt_emb  ──→ MSE(pred, tgt)          │   ┌─────────▼────────────┐
-       │                                              │   │ ARPredictor rollout │
-       ▼                                              │   │ (autoregressive)    │
-  ┌──────────────────────────┐                        │   │ emb_0 → emb_1 → ... │
-  │     ARPredictor          │                        │   └─────────┬────────────┘
-  │  causal transformer ×6   │                        │             │
-  │  AdaLN-zero condition    │←── action_emb          │             ▼
-  └────────────┬─────────────┘                        │   ┌──────────────────────┐
-               │                                      │   │ criterion:           │
-               ▼                                      │   │ min MSE(pred[-1],    │
-         pred_emb (B,T,192)                           │   │         goal_emb)    │
-               │                                      │   └─────────┬────────────┘
-               ▼                                      │             │
-   ┌──────────────────────┐                           │             ▼
-   │ pred_proj (MLP)      │                           │   Execute best action
-   └──────────────────────┘                           │   step 0, replan
-                                                      │
-   Loss = MSE(pred, tgt) + 0.09 × SIGReg(emb)
-```
-
-Key components (all paths relative to repo root):
-
-| Component | File | Role |
-|-----------|------|------|
-| `JEPA` | `jepa.py:11` | Top-level class: encode → predict → rollout → criterion |
-| `ARPredictor` | `module.py:244` | Causal Transformer with AdaLN-zero conditioning |
-| `SIGReg` | `module.py:10` | Epps-Pulley Gaussian regularizer (prevents collapse) |
-| `MLP` | `module.py:217` | Shared projection head (projector / pred_proj) |
-| `Embedder` | `module.py:189` | Action encoder (Conv1d + MLP) |
-| ViT encoder | `stable_pretraining` | HuggingFace-style ViT (tiny, patch=14, img=224) |
-| `lejepa_forward` | `train.py:17` | Per-batch forward + loss computation |
-
-### The Collapse Problem and SIGReg
-
-**Problem:** If the model only had the MSE prediction loss, the encoder would learn to output a constant vector (e.g., all zeros) — making the prediction loss trivially zero. This is **representation collapse**.
-
-**Solution — SIGReg (Sketch Isotropic Gaussian Regularizer):** Forces the embedding distribution toward a standard Gaussian N(0, I). If embeddings must be Gaussian-distributed, they cannot all collapse to the same point.
-
-Mechanism: project embeddings onto 1024 random directions, then check whether the projected values match the characteristic function of N(0, I): φ(t) = exp(-t²/2). This uses the Epps-Pulley test statistic over 17 evaluation points.
-
-**Why 0.09?** This is the only hyperparameter you tune:
-- Too large → embeddings are forced into a rigid Gaussian, losing semantic structure
-- Too small → collapse is not prevented
-- 0.09 is the equilibrium point validated across PushT, Cube, TwoRoom, and Reacher tasks
+- [环境安装与数据准备](#环境安装与数据准备)
+- [代码结构速览](#代码结构速览)
+- [训练流程标准](#训练流程标准)
+- [推理流程标准（MPC 规划）](#推理流程标准mpc-规划)
+- [学习计划：PushT → CarRacing → CARLA → 真实机器人](#学习计划pusht--carracing--carla--真实机器人)
+- [超参与训练诊断](#超参与训练诊断)
+- [适配新任务](#适配新任务)
 
 ---
 
-## Training Process — Step by Step
+## 环境安装与数据准备
 
-### Data Format
+```bash
+# 环境
+uv venv --python=3.10 && source .venv/bin/activate
+uv pip install stable-worldmodel[train,env]
 
-Each batch contains a contiguous sequence of frames + actions from pre-collected expert demonstrations (HDF5 format):
+# 数据（PushT 为例）
+tar --zstd -xvf pusht_expert_train.tar.zst -C $STABLEWM_HOME/
+```
+
+数据文件（`.h5` 格式）放在 `$STABLEWM_HOME`（默认 `~/.stable-wm/`）。可覆盖：
+
+```bash
+export STABLEWM_HOME=/你要的路径
+```
+
+配置中引用数据集时 **不加 `.h5` 后缀**。例如 `config/train/data/pusht.yaml` 里写 `pusht_expert_train`，实际文件为 `$STABLEWM_HOME/pusht_expert_train.h5`。
+
+---
+
+## 代码结构速览
+
+四个核心文件，核心逻辑约 400 行：
+
+| 文件 | 职责 | 关键函数/类 |
+|------|------|------------|
+| `train.py` | 训练入口，Hydra 加载配置 → 数据 → 模型 → Lightning 训练 | `lejepa_forward()` |
+| `jepa.py` | JEPA 主类：编码、预测、推演、代价计算 | `encode()`, `predict()`, `rollout()`, `criterion()`, `get_cost()` |
+| `module.py` | 自定义底层模块 | `ARPredictor`, `SIGReg`, `MLP`, `Embedder`, `ConditionalBlock` |
+| `utils.py` | 图像预处理、Z-score 归一化、checkpoint 回调 | `get_img_preprocessor()`, `get_column_normalizer()` |
+
+辅助目录：
 
 ```
-pixels:  (B, T_total, C, H, W)    e.g., (128, 4, 3, 224, 224) — 4 consecutive frames
-action:  (B, T_total-1, act_dim)  e.g., (128, 3, 2)          — 3 actions between frames
+config/train/             Hydra 训练配置：lewm.yaml → model/lewm.yaml + data/{任务}.yaml
+config/eval/              评估配置：环境 + CEM 求解器 + 规划预算
 ```
 
-Where `T_total = history_size + num_preds = 3 + 1 = 4`.
+### 架构全景图
 
-### One Forward Pass (`lejepa_forward` in `train.py:17`)
+```
+                    训练                                    │              推理 (MPC)
+                                                           │
+ pixels (B,T,C,H,W) + action (B,T-1,act_dim)               │   当前观测 + 目标图像
+      │                                                    │        │
+      ▼                                                    │        ▼
+ ┌──────────┐     ┌──────────┐                             │  encode(obs)   encode(goal)
+ │  ViT ×T  │     │  ViT ×T  │  ← 同一编码器                │      │              │
+ │ 逐帧独立  │     │ 逐帧独立  │    无 EMA，无 stop-grad     │      ▼              ▼
+ └────┬─────┘     └────┬─────┘                             │   emb_0         goal_emb
+      │                │                                   │      │
+      ▼                ▼                                   │      ▼
+ ┌──────────┐     ┌──────────┐                             │  ┌─────────────────────────┐
+ │projector │     │projector │  ← MLP(192→2048→192)       │  │ 采样 64 条候选动作序列    │
+ └────┬─────┘     └────┬─────┘                             │  └───────────┬─────────────┘
+      │                │                                   │              │
+      ▼                ▼                                   │  ┌───────────▼─────────────┐
+ emb (B,T,192)    tgt_emb ───→ MSE(pred, tgt)             │  │ ARPredictor rollout     │
+      │                                                    │  │ 自回归推演，不碰新图像    │
+      ▼                                                    │  │ emb₀ → emb₁ → ... → embₙ│
+ ┌────────────────────────────┐                            │  └───────────┬─────────────┘
+ │       ARPredictor          │                            │              │
+ │  因果 Transformer ×6       │                            │              ▼
+ │  AdaLN-zero 条件注入       │←── action_emb               │  ┌─────────────────────────┐
+ └─────────────┬──────────────┘                            │  │ criterion:              │
+               │                                           │  │ min MSE(pred[-1], goal) │
+               ▼                                           │  └───────────┬─────────────┘
+         pred_emb (B,T,192)                                │              │
+               │                                           │              ▼
+               ▼                                           │  执行最优动作第 0 步，重新规划
+   ┌────────────────────┐                                  │
+   │ pred_proj (MLP)    │                                  │
+   └────────────────────┘                                  │
 
-**Step 1 — Encode all frames independently** (`jepa.py:29`)
+   Loss = MSE(pred, tgt) + 0.09 × SIGReg(all_emb)
+```
 
-```python
+### SIGReg：防止表示坍缩的唯一防线
+
+只保留 MSE 预测 loss 会出问题：编码器学到把所有图像映射到同一个常数向量（如全零），预测 loss 为零，但学到了空气。这就是**表示坍缩**。
+
+SIGReg（Sketch Isotropic Gaussian Regularizer）强制嵌入分布接近标准高斯 N(0, I)。原理：把嵌入投影到 1024 个随机方向上，用 Epps-Pulley 检验检查投影值是否匹配标准高斯的特征函数 φ(t) = exp(-t²/2)。不匹配就惩罚。既然所有嵌入必须像高斯一样分散，就不可能挤到同一个点上。
+
+权重 0.09 是唯一的可调超参：太大 → 强制高斯过于刚性，丧失语义结构；太小 → 坍缩拦不住。0.09 是 PushT/Cube/TwoRoom/Reacher 四个任务上验证的均衡点。
+
+---
+
+## 训练流程标准
+
+### 第一步 — 准备数据
+
+离线数据集：预录的专家演示轨迹，HDF5 格式。每次取连续 `history_size + num_preds` 帧。以 PushT 为例：
+
+```
+每个 batch:
+  pixels: (128, 4, 3, 224, 224)   ← 连续 4 帧 (history_size=3 + num_preds=1)
+  action: (128, 3, 2)             ← 帧间的 3 个动作
+```
+
+图像预处理：转 0-1 → ImageNet 均值/标准差归一化 → Resize 到 224×224。动作做 Z-score 归一化。序列边界处的 NaN 用 `nan_to_num` 置零。
+
+代码路径：`train.py:47-79`（数据集加载 + 预处理）。
+
+### 第二步 — 编码
+
+把所有帧拍平到 batch 维，逐帧独立通过 ViT，取 CLS token，过 projector MLP。
+
+```
 pixels (B, 4, C, H, W)
-  → rearrange to (B*4, C, H, W)   # flatten time into batch
-  → ViT per frame                  # each frame gets its own CLS token
-  → projector MLP                  # 192 → 2048 → 192
-  → rearrange to (B, 4, 192)      # restore time dimension
+  → rearrange → (B*4, C, H, W)     # 时间维拍平，每帧当作独立图像
+  → ViT → CLS token → (B*4, 192)
+  → projector MLP(192→2048→192)    # 映射到共享嵌入空间
+  → rearrange → emb (B, 4, 192)    # 恢复时间维
+
+action (B, 3, act_dim)
+  → Embedder (Conv1d + MLP) → act_emb (B, 3, 192)
 ```
 
-Actions go through `action_encoder` (Conv1d kernel=1 + MLP) → `act_emb: (B, 3, 192)`.
+代码路径：`jepa.py:29-45`。
 
-**Step 2 — Split context and target**
+### 第三步 — 切分上下文与目标
 
 ```
-ctx_emb = emb[:, :3]     # frames 0, 1, 2 — what the predictor sees
-tgt_emb = emb[:, 1:]     # frames 1, 2, 3 — what the predictor should predict
-ctx_act = act_emb[:, :3] # actions 0, 1, 2
+ctx_emb = emb[:, :3]     # 帧 0,1,2 — 预测器的输入
+tgt_emb = emb[:, 1:]     # 帧 1,2,3 — 预测器应输出的真实嵌入（标签）
+ctx_act = act_emb[:, :3] # 动作 0,1,2 — 条件信号
 ```
 
-The alignment: predictor sees frame `t` + action `t`, predicts frame `t+1`'s embedding.
+时序对齐：预测器拿到帧 t 的嵌入 + 动作 t，应预测帧 t+1 的嵌入。训练时用 MSE 逐位比较。
 
-**Step 3 — Predict** (`jepa.py:47` → `module.py:276`)
+代码路径：`train.py:30-36`。
 
-The `ARPredictor` is a 6-layer causal Transformer with AdaLN-zero conditioning:
-- Action embeddings modulate each layer via learned scale/shift parameters
-- Causal masking ensures position `t` only attends to `≤t`
-- Gate parameters initialized to 0 → model first learns to ignore actions, then gradually incorporates them
+### 第四步 — 预测
+
+ARPredictor：6 层因果 Transformer，AdaLN-zero 条件注入。
 
 ```
 ARPredictor.forward(x=ctx_emb, c=ctx_act):
-  x += pos_embedding        # inject learned positional encoding
-  for each ConditionalBlock:
-    shift, scale, gate = adaLN_modulation(c)  # 6 params from action
-    x += gate * attn(modulate(LN(x), shift, scale))  # causal attention
-    x += gate * mlp(modulate(LN(x), shift, scale))   # FFN
-  return x                  # (B, 3, 192) — predicted next embeddings
+  x += pos_embedding           # 可学习位置编码
+  for 每个 ConditionalBlock:
+    shift, scale, gate = adaLN_modulation(c)  # 从动作嵌入生成 6 个调制参数
+    x += gate * attention(modulate(LN(x), shift, scale))  # 因果注意力
+    x += gate * mlp(modulate(LN(x), shift, scale))        # 前馈网络
+  return x  # (B, 3, 192)
 ```
 
-**Step 4 — Compute loss** (`train.py:38-41`)
+AdaLN-zero 的关键：gate 初始化为 0，训练初期条件分支被关闭，模型先学"单靠视觉能预测多少"，再逐渐学会利用动作信号。因果掩码确保位置 t 只能 attend ≤t 的位置（自回归约束）。
+
+代码路径：`jepa.py:47-55` → `module.py:244-285`（ARPredictor）→ `module.py:88-111`（ConditionalBlock）。
+
+### 第五步 — 计算 Loss
 
 ```python
-pred_loss   = (pred_emb - tgt_emb).pow(2).mean()   # prediction error
-sigreg_loss = self.sigreg(emb.transpose(0, 1))      # Gaussian regularizer
-loss        = pred_loss + 0.09 * sigreg_loss         # final loss
+# train.py:38-45
+pred_loss   = (pred_emb - tgt_emb).pow(2).mean()   # 预测误差
+sigreg_loss = sigreg(emb.transpose(0, 1))            # 高斯正则
+loss        = pred_loss + 0.09 * sigreg_loss          # 最终 loss
 ```
 
-Note: `tgt_emb` comes from the **same encoder**, with **no stop-gradient**, **no EMA**, and **no auxiliary loss terms**. The SIGReg alone prevents collapse.
+两点注意：
+- `tgt_emb` 来自**同一个编码器**，无 stop-grad、无 EMA、无额外 trick
+- SIGReg 统计的是所有嵌入（上下文 + 目标），而非仅预测值。约束的是编码器产出的分布本身
 
-### Training Hyperparameters
-
-| Hyperparameter | Value | Rationale |
-|---------------|-------|-----------|
-| `embed_dim` | 192 | Compact enough to prevent trivial solutions, large enough for rich semantics |
-| `history_size` | 3 | 3 frames suffice for short-horizon dynamics; longer = more memory |
-| `num_preds` | 1 | Single-step prediction; multi-step tested but 1-step works best |
-| `predictor depth` | 6 | Shallow enough for fast training, deep enough for causal reasoning |
-| `lr` | 5e-5 | Low lr prevents embedding space drift |
-| `weight_decay` | 1e-3 | Light regularization on ViT backbone |
-| `batch_size` | 128 | Balances GPU memory and gradient stability |
-| `gradient_clip` | 1.0 | Prevents SIGReg gradient spikes during early training |
-| `precision` | bf16 | 2× speedup over fp32, no stability issues |
-| `epochs` | 100 | ~3-6 hours on a single GPU |
-
-### Training Curves to Watch
-
-- **pred_loss**: Should decrease steadily. If it plateaus high, the predictor capacity may be insufficient.
-- **sigreg_loss**: Should stabilize around a small positive value. If it drops to zero, collapse is happening (increase λ). If it spikes and stays high, embeddings are being forced too hard (decrease λ).
-- **val/pred_loss**: Should track training loss without a significant gap.
-
----
-
-## Inference & Planning — Step by Step
-
-LeWM is used for **Model Predictive Control (MPC)** at inference time. The trained model serves as a "world simulator" that imagines future states in embedding space.
-
-### MPC Loop (`jepa.py:128` → `eval.py`)
-
-For each environment step:
-
-1. **Encode current observation**: `encode(pixels)` → `emb_0: (1, 192)`
-2. **Encode goal image**: `encode(goal)` → `goal_emb: (1, 192)`
-3. **Sample action candidates**: 64 random action sequences, each with `T` steps (e.g., T=16)
-4. **Rollout** each candidate (see below) → `predicted_emb: (1, 64, T, 192)`
-5. **Score** each candidate: `MSE(predicted_emb[...,-1:], goal_emb)` → cost `(1, 64)`
-6. **Pick** the best candidate, execute its first action
-7. **Replan** from the new observation (go to step 1)
-
-### Rollout (`jepa.py:61`)
-
-The rollout is purely in embedding space — no new images are encoded:
-
-```python
-emb = encode(current_pixels)                    # (1, 192) — initial state
-for t in range(n_steps):                         # e.g., 16 future steps
-    # Use last history_size=3 embeddings as context window
-    context = emb[:, -3:]                        # sliding window
-    # Encode the action at this step
-    act_emb = action_encoder(action[:, t])
-    # Predict next embedding
-    next_emb = predictor(context, act_emb)[:, -1:]  # take last position
-    # Append to history
-    emb = cat([emb, next_emb])
-# Final comparison: is the last predicted embedding close to goal_emb?
-```
-
-### CEM Solver (Optional but Recommended)
-
-The default evaluation uses **Cross-Entropy Method (CEM)** instead of pure random sampling:
-1. Sample 64 random action sequences
-2. Evaluate all, keep top-k (e.g., 16)
-3. Fit a Gaussian to the top-k sequences
-4. Resample 64 new sequences from this Gaussian
-5. Repeat 3-5 iterations → progressively refines toward the optimal plan
-
-This typically yields 2-3× better planning performance than single-pass random sampling.
-
----
-
-## Learning Path: PushT → CarRacing → CARLA → Real Robot
-
-A progressive curriculum for mastering JEPA-based world models, ordered by visual complexity and data requirements.
-
-### Stage 1: PushT (Push T-block to Target)
-
-**Why first:** Fully configured in this repo. Single GPU, 3-6 hours. Produces visible results.
-
-**What you learn:**
-- End-to-end training pipeline (data → model → checkpoint → eval)
-- How SIGReg prevents collapse (visualize embedding distributions)
-- MPC planning with rollout and CEM
-
-**Metrics to track:** pred_loss curve, sigreg_loss curve, planning success rate
-
-**Data:** Pre-collected expert demonstrations (HDF5). Download from HuggingFace.
-
-**Estimated effort:** 1-2 days (mostly waiting for training)
-
-### Stage 2: CarRacing-v3 (Gymnasium / Box2D)
-
-**Why second:** Slightly more complex visuals (road, car shape, track markings), continuous control (steering + throttle + brake), longer horizons. Same offline-training paradigm, but you need to collect your own data.
-
-**What you learn:**
-- Building a custom data collection pipeline (run a policy, record frames+actions to HDF5)
-- Adapting LeWM to a new environment (write a data config YAML, tune embed_dim / history_size)
-- Dealing with partially observable dynamics (car velocity matters, but isn't in the image directly)
-
-**Key differences from PushT:**
-- `action_dim`: 3 (steer, gas, brake) vs 2 in PushT
-- `history_size`: consider 5-8 (velocity estimation needs more frames)
-- `embed_dim`: consider 256-384 (more visual diversity)
-- Data: need 500-2000 expert trajectories (use a scripted policy or RL-pretrained agent)
-
-**Estimated effort:** 3-5 days (build data pipeline + train + tune)
-
-### Stage 3: CARLA (Photorealistic Driving Simulator)
-
-**Why third:** Photorealistic rendering, complex traffic scenarios, multi-agent dynamics. This is where JEPA's "predict in latent space" advantage becomes critical — pixel-level prediction would be infeasible.
-
-**What you learn:**
-- Handling high-resolution, photorealistic input (ViT-base or larger, 384×384 images)
-- Multi-modal prediction (other vehicles behave unpredictably — the embedding must represent uncertainty)
-- Long-horizon planning (driving decisions unfold over seconds, not frames)
-- Data augmentation and domain randomization
-
-**Key differences from CarRacing-v3:**
-- Encoder: upgrade from ViT-tiny → ViT-small or ViT-base
-- Image size: 224 → 384 or 448
-- `embed_dim`: 384-768
-- `history_size`: 10-16 (driving dynamics are slower)
-- Data: use CARLA's autopilot or collect human driving data
-- Consider adding auxiliary tasks (lane-keeping, speed prediction via probing)
-
-**Challenges to expect:**
-- Training time: 12-48 hours on a single GPU
-- SIGReg may need tuning for the larger embed_dim
-- The embedding space may need multi-step prediction (num_preds > 1) for stable long-horizon planning
-
-**Estimated effort:** 1-3 weeks
-
-### Stage 4: Real Robot World Model
-
-**Why last:** Real-world data has noise, distribution shift, and safety constraints. This is the ultimate test of whether your learned world model generalizes.
-
-**What you learn:**
-- Domain gap between simulation and reality
-- Fine-tuning strategies (pretrain in sim, adapt on real data)
-- Safety-critical planning (cost shaping, constraint handling)
-- Real-time inference optimization (model quantization, TensorRT)
-
-**Key differences from CARLA:**
-- Data: real robot teleoperation data (expensive to collect, high-value)
-- Pretraining: use CARLA-trained weights as initialization
-- Inference speed: may need model distillation or pruning for real-time control loops (>10 Hz)
-- Evaluation: success rate alone isn't enough — need surprise detection, uncertainty quantification
-
-**Prerequisites before attempting:**
-- Stages 1-3 completed
-- Reliable data collection infrastructure (teleoperation rig, synchronized cameras)
-- Safety fallback policies (rule-based or simple PID backup)
-
-**Estimated effort:** 4-8 weeks (heavily dependent on robot platform maturity)
-
-### Stage Progression Summary
-
-| Stage | Visual Complexity | Training Time | Data Required | Key Skill Learned |
-|-------|------------------|---------------|---------------|-------------------|
-| PushT | Low (solid shapes) | 3-6 hrs | Pre-collected | Core pipeline mastery |
-| CarRacing-v3 | Medium (textured) | 6-12 hrs | 500-2000 trajs | Custom data pipeline |
-| CARLA | High (photorealistic) | 12-48 hrs | 1000-5000 trajs | Scale & long-horizon |
-| Real Robot | High + noise + shift | Days | 100-1000 demos | Sim-to-real transfer |
-
----
-
-## Using the code
-This codebase builds on [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) for environment management, planning, and evaluation, and [stable-pretraining](https://github.com/galilai-group/stable-pretraining) for training. Together they reduce this repository to its core contribution: the model architecture and training objective.
-
-**Installation:**
-```bash
-uv venv --python=3.10
-source .venv/bin/activate
-uv pip install stable-worldmodel[train,env]
-```
-
-## Data
-
-Datasets use the HDF5 format for fast loading. Download the data from [HuggingFace](https://huggingface.co/collections/quentinll/lewm) and decompress with:
+### 训练命令
 
 ```bash
-tar --zstd -xvf archive.tar.zst
-```
+# WandB 配置（config/train/lewm.yaml）
+# 设置 entity 和 project，或关掉 wandb.enabled
 
-Place the extracted `.h5` files under `$STABLEWM_HOME` (defaults to `~/.stable-wm/`). You can override this path:
-```bash
-export STABLEWM_HOME=/path/to/your/storage
-```
-
-Dataset names are specified without the `.h5` extension. For example, `config/train/data/pusht.yaml` references `pusht_expert_train`, which resolves to `$STABLEWM_HOME/pusht_expert_train.h5`.
-
-## Training
-
-`jepa.py` contains the PyTorch implementation of LeWM. Training is configured via [Hydra](https://hydra.cc/) config files under `config/train/`.
-
-Before training, set your WandB `entity` and `project` in `config/train/lewm.yaml`:
-```yaml
-wandb:
-  config:
-    entity: your_entity
-    project: your_project
-```
-
-To launch training:
-```bash
+# 启动训练
 python train.py data=pusht
+
+# 用更浅的预测器（减少参数量）
+python train.py data=pusht model.predictor.depth=4
 ```
 
-Checkpoints are saved to `$STABLEWM_HOME` upon completion.
+### 训练中需要盯的曲线
 
-For baseline scripts, see the stable-worldmodel [scripts](https://github.com/galilai-group/stable-worldmodel/tree/main/scripts/train) folder.
+| 曲线 | 正常表现 | 异常信号 |
+|------|---------|---------|
+| `train/pred_loss` | 稳定下降 | 高平台 → 预测器容量不足，加深度或嵌入维度 |
+| `train/sigreg_loss` | 稳定在小的正值 | 跌到零 → 坍缩，增大 λ；飙升不降 → 过正则，减小 λ |
+| `val/pred_loss` | 紧跟训练 loss | 与训练 loss 分叉 → 过拟合，加 dropout 或减小模型 |
 
-## Planning
+Checkpoint 每个 epoch 保存一次到 `$STABLEWM_HOME/checkpoints/`。
 
-Evaluation configs live under `config/eval/`. Set the `policy` field to the checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix:
+---
+
+## 推理流程标准（MPC 规划）
+
+训练好的 LeWM 是一个"世界模拟器"——给定当前状态和动作，预测未来状态嵌入。推理时用它做模型预测控制（MPC）。
+
+### MPC 主循环
+
+每步环境交互执行以下流程：
+
+```
+1. encode(当前帧) → emb_0 (1, 192)
+2. encode(目标帧) → goal_emb (1, 192)
+3. 采样 64 条候选动作序列，每条 T 步（如 T=16）
+4. rollout: 每条候选序列自回归推演 T 步，得到预测嵌入轨迹
+5. criterion: MSE(每条轨迹的最终嵌入, goal_emb) → 64 个代价
+6. 选代价最小的序列，执行其第 1 个动作
+7. 环境给出新观测 → 回到步骤 1（重新规划）
+```
+
+代码路径：`jepa.py:128-153`（`get_cost`）→ `eval.py:49-173`。
+
+### Rollout 推演细节
+
+Rollout 完全在嵌入空间进行——**不需要任何新图像**。
+
+```
+输入: emb_0 (1, 192)  + 候选动作序列 (1, 64, T, act_dim)
+
+for t in range(推演步数):
+    context = emb[:, -3:]                    # 取最近 3 帧嵌入（滑动窗口）
+    act_emb = action_encoder(action[:, t])   # 编码当前步动作
+    next_emb = predictor(context, act_emb)[:, -1:]  # 预测下一步嵌入
+    emb = cat([emb, next_emb])               # 拼回历史
+
+输出: predicted_emb (1, 64, T, 192)  ← 每条候选序列的推演轨迹
+```
+
+代码路径：`jepa.py:61-110`。
+
+### CEM 求解器
+
+默认评估使用交叉熵方法（CEM）迭代精化，比单次随机采样效果好 2-3 倍：
+
+```
+第 1 轮：随机采样 64 条动作序列 → 评估 → 保留 top-16
+第 2 轮：用 top-16 拟合高斯分布 → 重新采样 64 条 → 评估 → 保留 top-16
+...重复 3-5 轮
+```
+
+最终选代价最小的序列执行。代码路径：`config/eval/solver/cem.yaml`。
+
+### 评估命令
 
 ```bash
-# ✓ correct
+# 用训练好的模型做评估
 python eval.py --config-name=pusht.yaml policy=pusht/lewm
 
-# ✗ incorrect
-python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
+# policy 是 $STABLEWM_HOME 下的相对路径，不加 _object.ckpt 后缀
 ```
 
-## Pretrained Checkpoints
+---
 
-Pretrained LeWM checkpoints for each environment are mirrored on the Hugging Face
-Hub (model repos), alongside the datasets (dataset repos) in the same collection:
+## 学习计划：PushT → CarRacing → CARLA → 真实机器人
 
-- [`quentinll/lewm-pusht`](https://huggingface.co/quentinll/lewm-pusht)
-- [`quentinll/lewm-cube`](https://huggingface.co/quentinll/lewm-cube)
-- [`quentinll/lewm-tworooms`](https://huggingface.co/quentinll/lewm-tworooms)
-- [`quentinll/lewm-reacher`](https://huggingface.co/quentinll/lewm-reacher)
+从零基础到能用 JEPA 做真实机器人世界模型的渐进路线，按视觉复杂度和数据需求递增排列。
 
-The full baseline checkpoint suite (PLDM, LeJEPA, IVL, IQL, GCBC, DINO-WM, DINO-WM-noprop)
-is available on [Google Drive](https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY_e5nh3XT4r4e):
+### 第一阶段：PushT（推动 T 形块到目标）
 
-<div align="center">
+**为什么先做这个：** 本仓库已完整配置，单 GPU 3-6 小时出结果。
 
-| Method | two-room | pusht | cube | reacher |
-|:---:|:---:|:---:|:---:|:---:|
-| pldm | ✓ | ✓ | ✓ | ✓ |
-| lejepa | ✓ | ✓ | ✓ | ✓ |
-| ivl | ✓ | ✓ | ✓ | — |
-| iql | ✓ | ✓ | ✓ | — |
-| gcbc | ✓ | ✓ | ✓ | — |
-| dinowm | ✓ | ✓ | — | — |
-| dinowm_noprop | ✓ | ✓ | ✓ | ✓ |
+**学到的能力：**
+- 端到端训练管线（数据 → 模型 → checkpoint → 评估）
+- 通过可视化嵌入分布理解 SIGReg 如何防止坍缩
+- MPC 规划（rollout + CEM 求解）
 
-</div>
+**需要跟踪的指标：** pred_loss 曲线、sigreg_loss 曲线、规划成功率
 
-## Loading a checkpoint
+**数据来源：** HuggingFace 下载预录专家数据
 
-### From the Drive archive
+**预估时间：** 1-2 天（大部分时间在等训练）
 
-Each tar archive contains two files per checkpoint:
-- `<name>_object.ckpt` — a serialized Python object for convenient loading; this is what `eval.py` and the `stable_worldmodel` API use
-- `<name>_weight.ckpt` — a weights-only checkpoint (`state_dict`) for cases where you want to load weights into your own model instance
+---
 
-Place the extracted files under `$STABLEWM_HOME/` and load via:
+### 第二阶段：CarRacing-v3（Gymnasium / Box2D）
 
-```python
-import stable_worldmodel as swm
+**为什么第二个：** 视觉略复杂（赛道纹理、车体形状），连续控制（转向 + 油门 + 刹车），更长的时序范围。同样离线训练，但需要自己采集数据。
 
-# Load the cost model (for MPC)
-cost = swm.policy.AutoCostModel('pusht/lewm')
-```
+**学到的能力：**
+- 构建自定义数据采集管线（运行策略 → 录制帧和动作 → 存为 HDF5）
+- 适配 LeWM 到新环境（写数据配置 YAML，调 embed_dim / history_size）
+- 处理部分可观测动力学（车速不能直接从单帧图像读出）
 
-`AutoCostModel` accepts:
-- `run_name` — checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix
-- `cache_dir` — optional override for the checkpoint root (defaults to `$STABLEWM_HOME`)
+**与 PushT 的关键差异：**
 
-The returned module is in `eval` mode with its PyTorch weights accessible via `.state_dict()`.
+| 项目 | PushT | CarRacing-v3 |
+|------|-------|-------------|
+| `action_dim` | 2（x, y 速度） | 3（转向、油门、刹车） |
+| `history_size` | 3 | 5-8（速度估计需要更多帧） |
+| `embed_dim` | 192 | 256-384（视觉多样性更大） |
+| 数据量 | 预录 | 500-2000 条轨迹 |
 
-### From the Hugging Face mirror
+**预估时间：** 3-5 天（搭数据管线 + 训练 + 调参）
 
-The HF model repos ship the LeWM checkpoint as a `weights.pt` (state dict) plus a
-`config.json` describing the model. Convert once to produce the `_object.ckpt`
-that `eval.py` expects:
+---
 
-```bash
-# download weights.pt + config.json
-hf download quentinll/lewm-pusht --local-dir $STABLEWM_HOME/hf_pusht
+### 第三阶段：CARLA（照片级驾驶模拟器）
 
-# convert to object checkpoint under $STABLEWM_HOME/pusht/lewm_object.ckpt
-python - <<'PY'
-import json, torch, stable_pretraining as spt
-from pathlib import Path
-from jepa import JEPA
-from module import ARPredictor, Embedder, MLP
-import stable_worldmodel as swm
+**为什么第三个：** 照片级渲染、复杂交通场景、多智能体交互。JEPA"在嵌入空间预测"的优势在这里真正体现——逐像素预测完全不现实。
 
-src = Path(swm.data.utils.get_cache_dir(), "hf_pusht")
-out = Path(swm.data.utils.get_cache_dir(), "pusht", "lewm_object.ckpt")
+**学到的能力：**
+- 处理高分辨率照片级输入（ViT-base 或更大，384×384 图像）
+- 多模态预测（其他车辆行为不可预测 → 嵌入需要编码不确定性）
+- 长时域规划（驾驶决策跨秒而非跨帧）
+- 数据增强和域随机化
 
-cfg = json.loads((src / "config.json").read_text())
-encoder = spt.backbone.utils.vit_hf(
-    cfg["encoder"]["size"],
-    patch_size=cfg["encoder"]["patch_size"],
-    image_size=cfg["encoder"]["image_size"],
-    pretrained=False, use_mask_token=False,
-)
-mlp = lambda k: MLP(input_dim=cfg[k]["input_dim"], output_dim=cfg[k]["output_dim"],
-                    hidden_dim=cfg[k]["hidden_dim"], norm_fn=torch.nn.BatchNorm1d)
-model = JEPA(
-    encoder=encoder,
-    predictor=ARPredictor(**cfg["predictor"]),
-    action_encoder=Embedder(**cfg["action_encoder"]),
-    projector=mlp("projector"),
-    pred_proj=mlp("pred_proj"),
-)
-sd = torch.load(src / "weights.pt", map_location="cpu", weights_only=False)
-model.load_state_dict(sd, strict=True)
-out.parent.mkdir(parents=True, exist_ok=True)
-torch.save(model, out)
-PY
-```
+**与 CarRacing-v3 的关键差异：**
 
-After conversion, load via `swm.policy.AutoCostModel('pusht/lewm')` as usual.
+| 项目 | CarRacing-v3 | CARLA |
+|------|-------------|-------|
+| 编码器 | ViT-tiny | ViT-small 或 ViT-base |
+| 图像尺寸 | 224 | 384 或 448 |
+| `embed_dim` | 256-384 | 384-768 |
+| `history_size` | 5-8 | 10-16（驾驶动力学更慢） |
+| 数据来源 | 脚本策略 | CARLA 自动驾驶或人工驾驶数据 |
+| 训练时间 | 6-12 小时 | 12-48 小时 |
 
-## Contact & Contributions
-Feel free to open [issues](https://github.com/lucas-maes/le-wm/issues)! For questions or collaborations, please contact `lucas.maes@mila.quebec`
+**可能的坑：**
+- SIGReg 在大嵌入维度下可能需要重新调权重
+- 嵌入空间可能需要多步预测（`num_preds > 1`）来稳定长时域规划
+- 考虑加辅助探测任务（车道保持、速度预测）
+
+**预估时间：** 1-3 周
+
+---
+
+### 第四阶段：真实机器人世界模型
+
+**为什么最后：** 真实数据有噪声、分布漂移、安全约束。这是学到的世界模型能否泛化的终极检验。
+
+**学到的能力：**
+- 仿真到现实的域差距处理
+- 微调策略（仿真预训练 → 真实数据适配）
+- 安全关键规划（代价塑形、约束处理）
+- 实时推理优化（量化、TensorRT）
+
+**与 CARLA 的关键差异：**
+
+| 项目 | CARLA | 真实机器人 |
+|------|-------|----------|
+| 数据 | CARLA 自动驾驶 | 真实遥操作数据（昂贵、高价值） |
+| 预训练 | 从零训练 | 用 CARLA 权重做初始化 |
+| 推理速度 | 不限 | 可能需要蒸馏或剪枝（>10 Hz） |
+| 评估 | 成功率 | 成功率 + 意外检测 + 不确定性量化 |
+
+**前置条件：** 前三阶段全部完成 + 可靠的数据采集基础设施（遥操作装置 + 同步相机）+ 安全回退策略（规则或 PID 备份）
+
+**预估时间：** 4-8 周（高度依赖机器人平台成熟度）
+
+---
+
+### 四阶段总览
+
+| 阶段 | 视觉复杂度 | 训练时间 | 数据需求 | 核心能力 |
+|------|-----------|---------|---------|---------|
+| PushT | 低（纯色几何体） | 3-6 小时 | 预录数据 | 掌握核心管线 |
+| CarRacing-v3 | 中（有纹理） | 6-12 小时 | 500-2000 条轨迹 | 自定义数据管线 |
+| CARLA | 高（照片级） | 12-48 小时 | 1000-5000 条轨迹 | 规模化 + 长时域 |
+| 真实机器人 | 高 + 噪声 + 漂移 | 数天 | 100-1000 次演示 | 仿真到现实迁移 |
+
+---
+
+## 超参与训练诊断
+
+### 核心超参
+
+| 参数 | 默认值 | 何时调 |
+|------|-------|-------|
+| `sigreg.weight` | 0.09 | 每个新环境必调 |
+| `embed_dim` | 192 | 视觉复杂场景增大（256-384） |
+| `history_size` | 3 | 需要速度估计的任务增大（5-8） |
+| `predictor depth` | 6 | 更长时域动力学加深 |
+| `lr` | 5e-5 | 敏感；1e-4 常导致发散 |
+| `batch_size` | 128 | OOM 时减小（SIGReg 稳定至少需 64） |
+| `gradient_clip` | 1.0 | 防止 SIGReg 梯度在训练早期爆炸 |
+
+### 故障排查
+
+| 症状 | 诊断 | 处理 |
+|------|------|------|
+| SIGReg loss 跌到 0 | 表示坍缩 | 增大 `sigreg.weight` |
+| SIGReg loss 飙升不降 | 过正则 | 减小 `sigreg.weight` |
+| pred_loss 高平台 | 预测器容量不足 | 加深或加宽 |
+| val/pred_loss 与训练分叉 | 过拟合 | 加 dropout、减模型尺寸 |
+| batch 中 action 出现 NaN | 数据集序列边界 | 代码已用 `nan_to_num` 处理 |
+
+---
+
+## 适配新任务
+
+### 可以改的文件
+
+- `config/train/data/{新任务}.yaml` — 数据集名称、`frameskip`、`keys_to_load`
+- `config/train/lewm.yaml` — `lr`、`batch_size`、`embed_dim`、`history_size`
+- `config/eval/{新任务}.yaml` — 环境、CEM 求解器参数、`goal_offset`、`eval_budget`
+- `train.py` — 为新数据列添加自定义 transform / normalizer
+- `utils.py` — 添加自定义预处理逻辑
+
+### 不要改的文件
+
+- `jepa.py` — JEPA 核心逻辑（encode/predict/rollout/criterion）。这是算法本身。
+- `module.py:10-36` — SIGReg 实现。数学脆弱，只通过 config 调 `knots`/`num_proj`。
