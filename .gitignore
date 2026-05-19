@@ -1,0 +1,15 @@
+.venv/
+venv/
+.idea/
+.git/
+.husky/
+.next/
+__pycache__/
+node_modules
+.pnpm-store
+dist
+coverage
+.DS_Store
+*.pyc
+.aider*
+.env
